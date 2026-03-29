@@ -10,6 +10,8 @@
 // ================================================================
 
 import express from 'express';
+import { webcrypto } from 'crypto';
+const crypto = webcrypto;
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
