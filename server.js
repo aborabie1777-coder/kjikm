@@ -31,10 +31,23 @@ app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Action');
   res.setHeader('Access-Control-Max-Age',       '86400');
+  res.setHeader('X-Content-Type-Options',   'nosniff');
+  res.setHeader('X-Frame-Options',          'DENY');
+  res.setHeader('X-XSS-Protection',         '1; mode=block');
+  res.setHeader('Referrer-Policy',          'no-referrer');
+  res.setHeader('Permissions-Policy',       'geolocation=(), microphone=(), camera=()');
+  res.removeHeader('X-Powered-By');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
+  if (req.path === '/api' && req.method !== 'POST')
+    return res.status(405).json({ success:false, error:'Method not allowed' });
   next();
 });
-app.use(express.text({ limit: '10kb', type: '*/*' }));  // raw text so we can sanitise manually
+app.use(express.text({ limit: '10kb', type: '*/*' }));
+
+// Input validation helpers
+function isValidUid(uid){ return typeof uid==='string' && /^\d{5,15}$/.test(uid); }
+function isValidAddress(addr){ return typeof addr==='string' && addr.length>=10 && addr.length<=100; }
+function isValidAmount(n){ return typeof n==='number' && isFinite(n) && n>0 && n<1e9; }
 
 // ── Helpers ──────────────────────────────────────────────────────
 const ok   = (d)     => ({ success: true,  data: d });
@@ -526,7 +539,7 @@ async function hBuyItem(uid, data, _meta={}){
   try{
     const { itemId, qty=1 } = data; const item = G.ITEMS[itemId];
     if(!item) return { success:false, error:'Unknown item' };
-    const q = Math.max(1,Math.min(99,parseInt(qty)||1)); const total = item.price*q;
+    const q = Math.max(1,Math.min(10,parseInt(qty)||1)); const total = item.price*q;
     const r = await dbGet(`users/${uid}`); const user = r.data;
     if(!user) return { success:false, error:'User not found' };
     if((user.bamboo||0)<total) return { success:false, error:'Not enough Bamboo' };
@@ -580,6 +593,7 @@ async function hExchange(uid, data, _meta={}){
       if(data.coinsAmount!==undefined){ await dbSet(lockKey,{ts:0}); return { success:false, error:'Coins to Bamboo exchange is disabled' }; }
       if(data.bambooAmount===undefined){ await dbSet(lockKey,{ts:0}); return { success:false, error:'Specify bambooAmount' }; }
       let nb=user.bamboo||0, nc=user.coins||0;
+      if(typeof data.bambooAmount !== 'number' && typeof data.bambooAmount !== 'string') { await dbSet(lockKey,{ts:0}); return { success:false, error:'Invalid bambooAmount type' }; }
       const bam = Math.floor(parseInt(data.bambooAmount)||0);
       if(bam<G.BAMBOO_PER_COIN){ await dbSet(lockKey,{ts:0}); return { success:false, error:`Min ${G.BAMBOO_PER_COIN} Bamboo` }; }
       if(nb<bam){ await dbSet(lockKey,{ts:0}); return { success:false, error:'Not enough Bamboo' }; }
@@ -599,7 +613,8 @@ async function hWithdraw(uid, data, _meta={}){
   try{
     const addr = (data.address||'').trim(); const amt = parseFloat(data.amount)||0;
     if(!addr||addr.length<10) return { success:false, error:'Invalid TON address' };
-    if(amt<G.MIN_WITHDRAW)    return { success:false, error:`Min ${G.MIN_WITHDRAW} Coins` };
+    if(!isValidAddress(addr))  return { success:false, error:'Invalid address format' };
+    if(!isFinite(amt)||amt<G.MIN_WITHDRAW) return { success:false, error:`Min ${G.MIN_WITHDRAW} Coins` };
     if(amt>1000000)           return { success:false, error:'Amount too large' };
     const lockKey = `withdrawLocks/${uid}`;
     const lockRec = await dbGet(lockKey);
@@ -645,8 +660,9 @@ async function hWithdraw(uid, data, _meta={}){
 async function hDeposit(uid, data, _meta={}){
   try{
     const amt    = parseFloat(data.amount)||0;
-    const txHash = (data.txHash||'').slice(0,256);
-    if(!txHash||amt<G.MIN_DEPOSIT_TON) return { success:false, error:'Invalid deposit data' };
+    const txHash = (data.txHash||'').slice(0,256).trim();
+    if(!txHash||txHash.length<10) return { success:false, error:'Invalid txHash' };
+    if(!isFinite(amt)||amt<G.MIN_DEPOSIT_TON) return { success:false, error:'Invalid deposit data' };
     const safeHash = txHash.replace(/[^a-zA-Z0-9]/g,'_');
     const dup      = await dbGet(`txHashes/${safeHash}`);
     if(dup.data) return { success:false, error:'Duplicate transaction' };
@@ -658,32 +674,6 @@ async function hDeposit(uid, data, _meta={}){
     await dbSet(`txHashes/${safeHash}`,{depId,userId:uid,ts:Date.now()});
     log(uid,'deposit_initiated',{depId,txHash,amount_ton:amt,bamboo_before:(u.bamboo||0),coins_before:(u.coins||0),tonBalance_before:(u.tonBalance||0)},_meta);
     return { success:true, data:{ depositId:depId, message:'Transaction registered. Your balance will be added within 3 minutes.' } };
-  }catch(e){ return { success:false, error:e.message }; }
-}
-
-async function hVerifyDeposit(uid, data, _meta={}){
-  try{
-    const { depositId, txHash } = data;
-    const dr  = await dbGet(`users/${uid}/deposits/${depositId}`); const dep = dr.data;
-    if(!dep) return { success:false, error:'Deposit not found' };
-    if(dep.status==='completed') return { success:true, data:{ status:'completed', amount:dep.amount } };
-    try{
-      const res = await fetch(`https://toncenter.com/api/v2/getTransaction?hash=${encodeURIComponent(txHash||dep.txHash)}`);
-      if(res.ok){
-        const j = await res.json();
-        if(j.ok && j.result){
-          const tonAmt = parseFloat(dep.amount); const bamboo = Math.floor(tonAmt*G.TON_TO_BAMBOO);
-          await dbUpdate(`users/${uid}/deposits/${depositId}`,{status:'completed',completedAt:Date.now()});
-          const ur = await dbGet(`users/${uid}`); const u = ur.data||{};
-          await dbUpdate(`users/${uid}`,{bamboo:(u.bamboo||0)+bamboo,tonBalance:(u.tonBalance||0)+tonAmt,hasDeposited:true});
-          if(u.referredBy) await dbUpdate(`users/${u.referredBy}/referrals/${uid}`,{hasDeposited:true}).catch(()=>{});
-          await dbDelete(`pendingDeposits/${depositId}`);
-          log(uid,'deposit_completed',{depositId,txHash:txHash||dep.txHash,amount_ton:tonAmt,bamboo_added:bamboo,bamboo_before:(u.bamboo||0),bamboo_after:(u.bamboo||0)+bamboo,tonBalance_before:(u.tonBalance||0),tonBalance_after:(u.tonBalance||0)+tonAmt},_meta);
-          return { success:true, data:{ status:'completed', amount:tonAmt, bambooAdded:bamboo } };
-        }
-      }
-    }catch(_){}
-    return { success:true, data:{ status:'pending' } };
   }catch(e){ return { success:false, error:e.message }; }
 }
 
@@ -941,7 +931,6 @@ app.post('/api', async (req, res) => {
     case 'exchange'       : result = await hExchange      (uid, data, _meta); break;
     case 'withdraw'       : result = await hWithdraw      (uid, data, _meta); break;
     case 'deposit'        : result = await hDeposit       (uid, data, _meta); break;
-    case 'verifyDeposit'  : result = await hVerifyDeposit (uid, data, _meta); break;
     case 'claimTask'      : result = await hClaimTask     (uid, data, _meta); break;
     case 'verifyTask'     : result = await hVerifyTask    (uid, data, _meta); break;
     case 'createTask'     : result = await hCreateTask    (uid, data, _meta); break;
