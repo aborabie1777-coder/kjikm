@@ -32,7 +32,7 @@ app.use((req, res, next) => {
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
-app.use(express.text({ limit: '10kb' }));  // raw text so we can sanitise manually
+app.use(express.text({ limit: '10kb', type: '*/*' }));  // raw text so we can sanitise manually
 
 // ── Helpers ──────────────────────────────────────────────────────
 const ok   = (d)     => ({ success: true,  data: d });
